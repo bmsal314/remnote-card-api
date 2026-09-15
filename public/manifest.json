@@ -1,22 +1,13 @@
 {
   "manifestVersion": 1,
-  "id": "plugin_template",
-  "name": "Plugin Template",
-  "author": "remnote",
-  "repoUrl": "",
-  "version": {
-    "major": 0,
-    "minor": 0,
-    "patch": 1
-  },
+  "id": "bmsal314-remnote-card-api",
+  "name": "RemNote Card API",
+  "author": "Brendan Salisbury",
+  "repoUrl": "https://github.com/bmsal314/remnote-card-api",
+  "version": { "major": 0, "minor": 1, "patch": 0 },
   "theme": [],
   "enableOnMobile": false,
-  "description": "",
+  "description": "Creates and verifies structured RemNote cards from explicitly supplied local payloads.",
   "requestNative": false,
-  "requiredScopes": [
-    {
-      "type": "All",
-      "level": "Read"
-    }
-  ]
+  "requiredScopes": [{ "type": "All", "level": "ReadCreateModify" }]
 }
