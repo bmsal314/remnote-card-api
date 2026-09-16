@@ -4,10 +4,11 @@
   "name": "RemNote Card API",
   "author": "Brendan Salisbury",
   "repoUrl": "https://github.com/bmsal314/remnote-card-api",
-  "version": { "major": 0, "minor": 1, "patch": 0 },
+  "version": { "major": 0, "minor": 1, "patch": 1 },
   "theme": [],
   "enableOnMobile": false,
-  "description": "Creates and verifies structured RemNote cards from explicitly supplied local payloads.",
+  "description": "Personal test utility: builds structured cards from a locally supplied JSON payload inside a disposable, plugin-owned fixture document; verifies and deletes only that fixture.",
   "requestNative": false,
-  "requiredScopes": [{ "type": "All", "level": "ReadCreateModify" }]
+  "requiredScopes": [{ "type": "All", "level": "ReadCreateModifyDelete" }],
+  "unlisted": true
 }
