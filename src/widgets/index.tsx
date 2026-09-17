@@ -2,14 +2,15 @@ import { declareIndexPlugin, type ReactRNPlugin, SetRemType } from '@remnote/plu
 import '../style.css';
 import '../index.css';
 
-// Personal testing utility. Every command operates ONLY on a disposable
-// fixture document that this plugin itself created. Ownership is tracked by
-// Rem ID in plugin-synced storage, never by document name, so a user's real
-// document can never be selected, modified, or deleted by these commands.
+// Personal card-building utility. Disposable test commands operate ONLY on a
+// fixture document this plugin created (tracked by Rem ID, never by name).
+// The production command appends new sections/cards under one explicitly
+// configured target document and never modifies or deletes existing content.
 
 const ROOT = 'Instinct API Disposable Test';
 const OWNER_KEY = 'ownedFixtureRootId';
 const PAYLOAD_SETTING = 'card-payload';
+const TARGET_SETTING = 'target-document-id';
 const SAMPLE_IMAGE =
   'https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/Placeholder_view_vector.svg/320px-Placeholder_view_vector.svg.png';
 
@@ -125,24 +126,54 @@ async function makeCard(
   return rem;
 }
 
+function validateCard(c: unknown, label: string) {
+  if (typeof c !== 'object' || c === null) throw new Error(`${label}: not an object.`);
+  const card = c as Record<string, unknown>;
+  if (!['forward', 'both', 'concept', 'list', 'cloze'].includes(String(card.type)))
+    throw new Error(`${label}: type must be forward, both, concept, list, or cloze.`);
+  if (typeof card.front !== 'string' || !card.front)
+    throw new Error(`${label}: front must be a non-empty string.`);
+  if (card.type === 'list' && (!Array.isArray(card.items) || card.items.length === 0))
+    throw new Error(`${label}: list cards need a non-empty items array.`);
+  if (card.type === 'cloze') {
+    const cloze = card.cloze as { start?: number; end?: number } | undefined;
+    if (!cloze || typeof cloze.start !== 'number' || typeof cloze.end !== 'number')
+      throw new Error(`${label}: cloze cards need cloze.start and cloze.end character offsets.`);
+  }
+}
+
 function validatePayload(raw: unknown): any[] {
   if (!Array.isArray(raw)) throw new Error('Payload must be a JSON array of card specs.');
-  raw.forEach((c, i) => {
-    if (typeof c !== 'object' || c === null) throw new Error(`Card ${i + 1}: not an object.`);
-    const card = c as Record<string, unknown>;
-    if (!['forward', 'both', 'concept', 'list', 'cloze'].includes(String(card.type)))
-      throw new Error(`Card ${i + 1}: type must be forward, both, concept, list, or cloze.`);
-    if (typeof card.front !== 'string' || !card.front)
-      throw new Error(`Card ${i + 1}: front must be a non-empty string.`);
-    if (card.type === 'list' && (!Array.isArray(card.items) || card.items.length === 0))
-      throw new Error(`Card ${i + 1}: list cards need a non-empty items array.`);
-    if (card.type === 'cloze') {
-      const cloze = card.cloze as { start?: number; end?: number } | undefined;
-      if (!cloze || typeof cloze.start !== 'number' || typeof cloze.end !== 'number')
-        throw new Error(`Card ${i + 1}: cloze cards need cloze.start and cloze.end character offsets.`);
-    }
-  });
+  raw.forEach((c, i) => validateCard(c, `Card ${i + 1}`));
   return raw as any[];
+}
+
+// Sections form: { "sections": [ { title, cards?, sections? }, ... ] }
+function validateSectionedPayload(raw: unknown): any[] {
+  if (typeof raw !== 'object' || raw === null || !Array.isArray((raw as any).sections))
+    throw new Error('Payload must be { "sections": [ { "title": ..., "cards": [...], "sections": [...] } ] }.');
+  const check = (s: any, path: string) => {
+    if (typeof s !== 'object' || s === null || typeof s.title !== 'string' || !s.title)
+      throw new Error(`${path}: section needs a non-empty title.`);
+    (s.cards ?? []).forEach((c: unknown, i: number) => validateCard(c, `${path} card ${i + 1}`));
+    (s.sections ?? []).forEach((sub: any, i: number) => check(sub, `${path} > section ${i + 1}`));
+  };
+  (raw as any).sections.forEach((s: any, i: number) => check(s, `Section ${i + 1}`));
+  return (raw as any).sections;
+}
+
+async function readPayloadSetting(plugin: ReactRNPlugin) {
+  const raw = await plugin.settings.getSetting<string>(PAYLOAD_SETTING);
+  if (!raw || !raw.trim()) {
+    await plugin.app.toast(`Paste a JSON card payload into the plugin setting "${PAYLOAD_SETTING}" first.`);
+    return undefined;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    await plugin.app.toast(`Payload is not valid JSON: ${(e as Error).message}`);
+    return undefined;
+  }
 }
 
 async function createDisposable(plugin: ReactRNPlugin) {
@@ -173,14 +204,11 @@ async function createDisposable(plugin: ReactRNPlugin) {
 }
 
 async function createFromPayload(plugin: ReactRNPlugin) {
-  const raw = await plugin.settings.getSetting<string>(PAYLOAD_SETTING);
-  if (!raw || !raw.trim()) {
-    await plugin.app.toast(`Paste a JSON card payload into the plugin setting "${PAYLOAD_SETTING}" first.`);
-    return;
-  }
+  const parsed = await readPayloadSetting(plugin);
+  if (parsed === undefined) return;
   let specs: any[];
   try {
-    specs = validatePayload(JSON.parse(raw));
+    specs = validatePayload(parsed);
   } catch (e) {
     await plugin.app.toast(`Payload error: ${(e as Error).message}`);
     return;
@@ -201,19 +229,104 @@ async function createFromPayload(plugin: ReactRNPlugin) {
   await plugin.app.toast(`Built ${specs.length} cards from the supplied payload inside the disposable fixture.`);
 }
 
-async function verifyDisposable(plugin: ReactRNPlugin) {
-  const root = await getOwnedRoot(plugin);
-  if (!root) throw new Error('No plugin-owned disposable fixture found.');
+// Finds a direct child of parent whose plain text equals title, or undefined.
+async function findChildByTitle(plugin: ReactRNPlugin, parent: any, title: string) {
+  const children = await parent.getChildren();
+  for (const child of children ?? []) {
+    if ((await plainText(plugin, child.text)) === title) return child;
+  }
+  return undefined;
+}
+
+// Appends sectioned cards under parent. A heading that already exists under
+// the same parent is reused in place (never duplicated, never modified) and
+// reported as skipped, so reruns are idempotent. Returns [created, skipped].
+async function buildSections(plugin: ReactRNPlugin, parent: any, sections: any[], counts: { created: number; skipped: number; cards: number }) {
+  for (const s of sections) {
+    let node = await findChildByTitle(plugin, parent, s.title);
+    if (node) {
+      counts.skipped += 1;
+    } else {
+      node = await plugin.rem.createRem();
+      if (!node) throw new Error(`Could not create section "${s.title}"`);
+      await node.setText(await text(plugin, s.title));
+      await node.setParent(parent);
+      if (s.heading === 'H1' || s.heading === 'H2' || s.heading === 'H3') await node.setFontSize(s.heading);
+      if (s.highlight) await node.setHighlightColor(s.highlight);
+      counts.created += 1;
+    }
+    for (const spec of s.cards ?? []) {
+      await makeCard(plugin, node, spec);
+      counts.cards += 1;
+    }
+    if (s.sections?.length) await buildSections(plugin, node, s.sections, counts);
+  }
+}
+
+async function buildIntoTarget(plugin: ReactRNPlugin) {
+  const targetId = (await plugin.settings.getSetting<string>(TARGET_SETTING))?.trim();
+  if (!targetId) {
+    await plugin.app.toast(`Set the "${TARGET_SETTING}" plugin setting to the target document's Rem ID first.`);
+    return;
+  }
+  const target = await plugin.rem.findOne(targetId);
+  if (!target) {
+    await plugin.app.toast(`No Rem found for "${TARGET_SETTING}" = ${targetId}. Nothing was created.`);
+    return;
+  }
+  if (!(await target.isDocument())) {
+    await plugin.app.toast(`Rem ${targetId} is not a document. Refusing to build. Nothing was created.`);
+    return;
+  }
+
+  const parsed = await readPayloadSetting(plugin);
+  if (parsed === undefined) return;
+  let sections: any[];
+  try {
+    sections = validateSectionedPayload(parsed);
+  } catch (e) {
+    await plugin.app.toast(`Payload error: ${(e as Error).message}`);
+    return;
+  }
+
+  const counts = { created: 0, skipped: 0, cards: 0 };
+  await buildSections(plugin, target, sections, counts);
+  await plugin.app.toast(
+    `Build complete: ${counts.cards} cards, ${counts.created} new sections, ${counts.skipped} existing sections reused. Existing content was not modified.`,
+  );
+}
+
+async function verifyReadback(plugin: ReactRNPlugin, root: any, storageKey: string, label: string) {
   const descendants = await root.allRemInDocumentOrPortal();
   const receipt = [] as string[];
   for (const rem of descendants) {
     const front = await plugin.richText.toString(rem.text);
     const back = rem.backText ? await plugin.richText.toString(rem.backText) : '';
     const cards = await rem.getCards();
-    receipt.push(`${front} | ${back} | cards=${cards.map((c) => JSON.stringify(c.type)).join(',')}`);
+    receipt.push(`${front} | ${back} | cards=${cards.map((c: any) => JSON.stringify(c.type)).join(',')}`);
   }
-  await plugin.storage.setSession('lastVerificationReceipt', receipt);
-  await plugin.app.toast(`Verified ${descendants.length} Rems in the disposable fixture. Receipt stored.`);
+  await plugin.storage.setSession(storageKey, receipt);
+  await plugin.app.toast(`Verified ${descendants.length} Rems in ${label}. Receipt stored.`);
+}
+
+async function verifyDisposable(plugin: ReactRNPlugin) {
+  const root = await getOwnedRoot(plugin);
+  if (!root) throw new Error('No plugin-owned disposable fixture found.');
+  await verifyReadback(plugin, root, 'lastVerificationReceipt', 'the disposable fixture');
+}
+
+async function verifyTarget(plugin: ReactRNPlugin) {
+  const targetId = (await plugin.settings.getSetting<string>(TARGET_SETTING))?.trim();
+  if (!targetId) {
+    await plugin.app.toast(`Set the "${TARGET_SETTING}" plugin setting first.`);
+    return;
+  }
+  const target = await plugin.rem.findOne(targetId);
+  if (!target || !(await target.isDocument())) {
+    await plugin.app.toast(`Target ${targetId} is not a document. Nothing to verify.`);
+    return;
+  }
+  await verifyReadback(plugin, target, 'lastTargetVerificationReceipt', 'the target document');
 }
 
 async function deleteDisposable(plugin: ReactRNPlugin) {
@@ -232,14 +345,31 @@ async function onActivate(plugin: ReactRNPlugin) {
     id: PAYLOAD_SETTING,
     title: 'Card payload (JSON)',
     description:
-      'JSON array of card specs used by "API Test: Create Cards From Supplied Payload". Cards are built only inside the disposable fixture document owned by this plugin.',
+      'JSON card specs. "Create Cards From Supplied Payload" takes a plain array; "Build Into Target Document" takes { "sections": [ { "title", "cards": [...], "sections": [...] } ] }.',
     multiline: true,
     defaultValue: '',
   });
-  await plugin.app.registerCommand({ id: 'create-disposable', name: 'API Test: Create Disposable Fixture', action: () => createDisposable(plugin) });
-  await plugin.app.registerCommand({ id: 'create-from-payload', name: 'API Test: Create Cards From Supplied Payload', action: () => createFromPayload(plugin) });
-  await plugin.app.registerCommand({ id: 'verify-disposable', name: 'API Test: Verify Disposable Fixture', action: () => verifyDisposable(plugin) });
-  await plugin.app.registerCommand({ id: 'delete-disposable', name: 'API Test: Delete Disposable Fixture', action: () => deleteDisposable(plugin) });
+  await plugin.settings.registerStringSetting({
+    id: TARGET_SETTING,
+    title: 'Target document Rem ID',
+    description:
+      'Rem ID of the one document "Build Into Target Document" may append sections and cards to. The command refuses to run unless this names an existing document. Existing content is never modified or deleted.',
+    multiline: false,
+    defaultValue: '',
+  });
+
+  const commands = [
+    { id: 'create-disposable', name: 'API Test: Create Disposable Fixture', action: () => createDisposable(plugin) },
+    { id: 'create-from-payload', name: 'API Test: Create Cards From Supplied Payload', action: () => createFromPayload(plugin) },
+    { id: 'verify-disposable', name: 'API Test: Verify Disposable Fixture', action: () => verifyDisposable(plugin) },
+    { id: 'delete-disposable', name: 'API Test: Delete Disposable Fixture', action: () => deleteDisposable(plugin) },
+    { id: 'build-into-target', name: 'API: Build Cards Into Target Document From Payload', action: () => buildIntoTarget(plugin) },
+    { id: 'verify-target', name: 'API: Verify Target Document', action: () => verifyTarget(plugin) },
+  ];
+  for (const command of commands) {
+    await plugin.app.registerCommand(command);
+    await plugin.app.registerSidebarButton(command);
+  }
 }
 
 async function onDeactivate(_: ReactRNPlugin) {}
