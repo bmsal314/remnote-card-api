@@ -7,11 +7,11 @@
   "version": {
     "major": 0,
     "minor": 2,
-    "patch": 0
+    "patch": 1
   },
   "theme": [],
   "enableOnMobile": false,
-  "description": "Personal card builder: creates structured cards from locally supplied JSON payloads - in a disposable test fixture, or appended under one explicitly configured target document.",
+  "description": "Personal structured-card builder with normalized section reuse, plugin-recorded reversible builds, exact-root rollback, disposable validation, and structural readback.",
   "requestNative": false,
   "requiredScopes": [
     {

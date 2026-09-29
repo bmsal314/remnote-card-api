@@ -11,6 +11,9 @@ const ROOT = 'Instinct API Disposable Test';
 const OWNER_KEY = 'ownedFixtureRootId';
 const PAYLOAD_SETTING = 'card-payload';
 const TARGET_SETTING = 'target-document-id';
+const ROLLBACK_IDS_SETTING = 'rollback-rem-ids';
+const LAST_RUN_KEY = 'lastProductionRun';
+const REGRESSION_KEY = 'hierarchyRegressionState';
 const SAMPLE_IMAGE =
   'https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/Placeholder_view_vector.svg/320px-Placeholder_view_vector.svg.png';
 
@@ -230,18 +233,31 @@ async function createFromPayload(plugin: ReactRNPlugin) {
 }
 
 // Finds a direct child of parent whose plain text equals title, or undefined.
+function normalizedTitle(value: string) {
+  return value
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[–—]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLocaleLowerCase();
+}
+
 async function findChildByTitle(plugin: ReactRNPlugin, parent: any, title: string) {
-  const children = await parent.getChildren();
+  const wanted = normalizedTitle(title);
+  const children = await parent.getChildrenRem();
   for (const child of children ?? []) {
-    if ((await plainText(plugin, child.text)) === title) return child;
+    if (normalizedTitle(await plainText(plugin, child.text)) === wanted) return child;
   }
   return undefined;
 }
 
 // Appends sectioned cards under parent. A heading that already exists under
 // the same parent is reused in place (never duplicated, never modified) and
-// reported as skipped, so reruns are idempotent. Returns [created, skipped].
-async function buildSections(plugin: ReactRNPlugin, parent: any, sections: any[], counts: { created: number; skipped: number; cards: number }) {
+// reported as skipped. Cards are always newly created and owned by this run.
+async function buildSections(plugin: ReactRNPlugin, parent: any, sections: any[], counts: { created: number; skipped: number; cards: number }, run: { targetId: string; createdIds: string[] }) {
   for (const s of sections) {
     let node = await findChildByTitle(plugin, parent, s.title);
     if (node) {
@@ -254,12 +270,16 @@ async function buildSections(plugin: ReactRNPlugin, parent: any, sections: any[]
       if (s.heading === 'H1' || s.heading === 'H2' || s.heading === 'H3') await node.setFontSize(s.heading);
       if (s.highlight) await node.setHighlightColor(s.highlight);
       counts.created += 1;
+      run.createdIds.push(node._id);
+      await plugin.storage.setSynced(LAST_RUN_KEY, run);
     }
     for (const spec of s.cards ?? []) {
-      await makeCard(plugin, node, spec);
+      const card = await makeCard(plugin, node, spec);
+      run.createdIds.push(card._id);
       counts.cards += 1;
+      await plugin.storage.setSynced(LAST_RUN_KEY, run);
     }
-    if (s.sections?.length) await buildSections(plugin, node, s.sections, counts);
+    if (s.sections?.length) await buildSections(plugin, node, s.sections, counts, run);
   }
 }
 
@@ -289,11 +309,136 @@ async function buildIntoTarget(plugin: ReactRNPlugin) {
     return;
   }
 
+  const prior = await plugin.storage.getSynced<{targetId: string; createdIds: string[]}>(LAST_RUN_KEY);
+  if (prior?.createdIds?.length) {
+    const stillExists = (await Promise.all(prior.createdIds.map((id) => plugin.rem.findOne(id)))).some(Boolean);
+    if (stillExists) {
+      await plugin.app.toast('Build refused: a previous plugin-recorded run still exists. Verify or roll it back before starting another run.');
+      return;
+    }
+    await plugin.storage.setSynced(LAST_RUN_KEY, undefined);
+  }
+
   const counts = { created: 0, skipped: 0, cards: 0 };
-  await buildSections(plugin, target, sections, counts);
+  const run = { targetId, createdIds: [] as string[] };
+  await plugin.storage.setSynced(LAST_RUN_KEY, run);
+  await buildSections(plugin, target, sections, counts, run);
   await plugin.app.toast(
     `Build complete: ${counts.cards} cards, ${counts.created} new sections, ${counts.skipped} existing sections reused. Existing content was not modified.`,
   );
+}
+
+async function rollbackIds(plugin: ReactRNPlugin, ids: string[], targetId: string, label: string) {
+  const unique = [...new Set(ids)].reverse();
+  const idSet = new Set(unique);
+  const removable = [] as any[];
+  for (const id of unique) {
+    const rem = await plugin.rem.findOne(id);
+    if (!rem) continue;
+    let ancestor = await rem.getParentRem();
+    let underTarget = false;
+    while (ancestor) {
+      if (ancestor._id === targetId) { underTarget = true; break; }
+      ancestor = await ancestor.getParentRem();
+    }
+    if (!underTarget) throw new Error(`Rollback refused: ${id} is not under target ${targetId}.`);
+    removable.push(rem);
+  }
+  // Delete only topmost recorded Rems; descendants disappear with their parent.
+  const roots = removable.filter((rem) => !rem.parent || !idSet.has(rem.parent));
+  for (const rem of roots) await rem.remove();
+  await plugin.app.toast(`${label}: removed ${roots.length} plugin-recorded roots (${removable.length} recorded Rems).`);
+}
+
+async function rollbackLastRun(plugin: ReactRNPlugin) {
+  const run = await plugin.storage.getSynced<{targetId: string; createdIds: string[]}>(LAST_RUN_KEY);
+  if (!run?.targetId || !run.createdIds?.length) {
+    await plugin.app.toast('Nothing rolled back: no plugin-recorded production run exists.');
+    return;
+  }
+  await rollbackIds(plugin, run.createdIds, run.targetId, 'Last production run rolled back');
+  await plugin.storage.setSynced(LAST_RUN_KEY, undefined);
+}
+
+async function rollbackExactRoots(plugin: ReactRNPlugin) {
+  const targetId = (await plugin.settings.getSetting<string>(TARGET_SETTING))?.trim();
+  const raw = (await plugin.settings.getSetting<string>(ROLLBACK_IDS_SETTING))?.trim();
+  if (!targetId || !raw) {
+    await plugin.app.toast(`Set both "${TARGET_SETTING}" and "${ROLLBACK_IDS_SETTING}" first.`);
+    return;
+  }
+  const ids = raw.split(/[\s,]+/).filter(Boolean);
+  await rollbackIds(plugin, ids, targetId, 'Exact-root rollback complete');
+}
+
+async function createHierarchyRegression(plugin: ReactRNPlugin) {
+  const existing = await getOwnedRoot(plugin);
+  if (existing) await existing.remove();
+
+  const root = await plugin.rem.createRem();
+  if (!root) throw new Error('Could not create regression root');
+  await root.setText(await text(plugin, ROOT));
+  await root.setIsDocument(true);
+  await root.setFontSize('H1');
+  await plugin.storage.setSynced(OWNER_KEY, root._id);
+
+  // This is intentionally visually identical but contains whitespace, a zero-width
+  // character and an em dash. It reproduces the manual-heading matching failure.
+  const manualModule = await plugin.rem.createRem();
+  if (!manualModule) throw new Error('Could not create manual regression module');
+  await manualModule.setText(await text(plugin, '  MODULE 1: HISTORY & METHODS\u200B  '));
+  await manualModule.setParent(root);
+  await manualModule.setFontSize('H2');
+
+  const manualTopic = await plugin.rem.createRem();
+  if (!manualTopic) throw new Error('Could not create manual regression topic');
+  await manualTopic.setText(await text(plugin, 'Q: Existing manual topic — exact hierarchy'));
+  await manualTopic.setParent(manualModule);
+  await manualTopic.setFontSize('H3');
+  const manualCard = await makeCard(plugin, manualTopic, {
+    type: 'forward', front: 'Manual card must survive?', back: 'Yes - it predates the plugin run.',
+  });
+
+  const sections = validateSectionedPayload({ sections: [{
+    title: 'module 1: history & methods', heading: 'H2', sections: [
+      { title: 'Q: Existing manual topic - exact hierarchy', heading: 'H3', cards: [
+        { type: 'forward', front: 'Run-created card under reused topic?', back: 'Rollback removes only this card.' },
+      ] },
+      { title: 'Q: Plugin-created topic', heading: 'H3', cards: [
+        { type: 'both', front: 'Created topic card', back: 'Created answer' },
+      ] },
+    ],
+  }] });
+  const counts = { created: 0, skipped: 0, cards: 0 };
+  const run = { targetId: root._id, createdIds: [] as string[] };
+  await plugin.storage.setSynced(LAST_RUN_KEY, run);
+  await buildSections(plugin, root, sections, counts, run);
+  await plugin.storage.setSynced(REGRESSION_KEY, {
+    rootId: root._id,
+    manualIds: [manualModule._id, manualTopic._id, manualCard._id],
+    createdIds: [...run.createdIds],
+  });
+  await plugin.app.toast(`Regression built: ${counts.skipped} existing sections reused, ${counts.created} sections and ${counts.cards} cards recorded for rollback.`);
+}
+
+async function verifyHierarchyRegression(plugin: ReactRNPlugin, afterRollback: boolean) {
+  const state = await plugin.storage.getSynced<{rootId: string; manualIds: string[]; createdIds: string[]}>(REGRESSION_KEY);
+  if (!state) throw new Error('No hierarchy regression state found.');
+  const root = await plugin.rem.findOne(state.rootId);
+  if (!root) throw new Error('Regression root is missing.');
+  const modules = [] as any[];
+  for (const child of await root.getChildrenRem()) {
+    if (normalizedTitle(await plainText(plugin, child.text)) === normalizedTitle('MODULE 1: HISTORY & METHODS')) modules.push(child);
+  }
+  if (modules.length !== 1) throw new Error(`Regression failed: expected one matching module, found ${modules.length}.`);
+  for (const id of state.manualIds) {
+    if (!(await plugin.rem.findOne(id))) throw new Error(`Regression failed: manual Rem ${id} is missing.`);
+  }
+  const createdExist = await Promise.all(state.createdIds.map((id) => plugin.rem.findOne(id)));
+  if (afterRollback && createdExist.some(Boolean)) throw new Error('Rollback regression failed: a run-created Rem still exists.');
+  if (!afterRollback && createdExist.some((rem) => !rem)) throw new Error('Build regression failed: a run-created Rem is missing before rollback.');
+  await verifyReadback(plugin, root, afterRollback ? 'regressionRollbackReceipt' : 'regressionBuildReceipt', afterRollback ? 'the rolled-back hierarchy regression' : 'the hierarchy regression');
+  await plugin.app.toast(afterRollback ? 'Rollback regression passed: manual hierarchy survived and all run-created Rems are gone.' : 'Build regression passed: one manual module was reused and all run-created Rems are present.');
 }
 
 async function verifyReadback(plugin: ReactRNPlugin, root: any, storageKey: string, label: string) {
@@ -357,14 +502,26 @@ async function onActivate(plugin: ReactRNPlugin) {
     multiline: false,
     defaultValue: '',
   });
+  await plugin.settings.registerStringSetting({
+    id: ROLLBACK_IDS_SETTING,
+    title: 'Exact rollback Rem IDs',
+    description: 'Space- or comma-separated Rem IDs observed from one specific plugin build. Rollback refuses IDs outside the configured target.',
+    multiline: true,
+    defaultValue: '',
+  });
 
   const commands = [
     { id: 'create-disposable', name: 'API Test: Create Disposable Fixture', action: () => createDisposable(plugin) },
     { id: 'create-from-payload', name: 'API Test: Create Cards From Supplied Payload', action: () => createFromPayload(plugin) },
     { id: 'verify-disposable', name: 'API Test: Verify Disposable Fixture', action: () => verifyDisposable(plugin) },
     { id: 'delete-disposable', name: 'API Test: Delete Disposable Fixture', action: () => deleteDisposable(plugin) },
+    { id: 'create-hierarchy-regression', name: 'API Test: Create Existing-Hierarchy Regression', action: () => createHierarchyRegression(plugin) },
+    { id: 'verify-hierarchy-regression', name: 'API Test: Verify Existing-Hierarchy Reuse', action: () => verifyHierarchyRegression(plugin, false) },
+    { id: 'verify-hierarchy-rollback', name: 'API Test: Verify Regression After Rollback', action: () => verifyHierarchyRegression(plugin, true) },
     { id: 'build-into-target', name: 'API: Build Cards Into Target Document From Payload', action: () => buildIntoTarget(plugin) },
     { id: 'verify-target', name: 'API: Verify Target Document', action: () => verifyTarget(plugin) },
+    { id: 'rollback-last-run', name: 'API: Roll Back Last Plugin Build', action: () => rollbackLastRun(plugin) },
+    { id: 'rollback-exact-roots', name: 'API: Roll Back Exact Recorded Roots', action: () => rollbackExactRoots(plugin) },
   ];
   for (const command of commands) {
     await plugin.app.registerCommand(command);

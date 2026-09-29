@@ -40,9 +40,10 @@ Production commands:
   document by name, so no user document can be removed or modified by the
   test commands. If a document happens to share the fixture's name and was
   not created by this plugin, the plugin warns and leaves it untouched.
-- The production build command is append-only: it refuses to run unless
-  `target-document-id` names an existing document, reuses (never duplicates
-  or modifies) sections that already exist, and never deletes anything.
+- The production build command refuses to run unless `target-document-id` names
+  an existing document. It reuses existing direct-child sections by normalized
+  visible title, never modifies them, and records every new Rem for rollback.
+  A new build is refused while recorded Rems from the previous run still exist.
 
 ## Payload formats
 
@@ -80,7 +81,8 @@ Production commands:
 Sections nest (`sections` inside a section). `heading` may be `H1`, `H2`,
 or `H3`; `highlight` is a RemNote highlight color. Both optional. A section
 title that already exists directly under the same parent is reused in
-place, so rerunning a build never duplicates structure.
+place, preventing duplicate structure. Cards are newly created per run; roll back
+the recorded run before rebuilding the same payload.
 
 ## Card types
 
@@ -89,3 +91,11 @@ place, so rerunning a build never duplicates structure.
 - `list`: multiline list card; `items` become the card's answer lines.
 - `cloze`: `cloze.start`/`cloze.end` are character offsets into `front`.
 - `imageUrl` (optional, any type): appends an image to the card front.
+
+## Reversible production runs (v0.2.1)
+
+- Existing section matching uses normalized Unicode, whitespace, quote and dash forms before comparing direct children.
+- Every newly created section and card is persisted as the current plugin-owned production run while the build is in progress.
+- `API: Roll Back Last Plugin Build` removes only the recorded Rem IDs under the recorded target.
+- `API: Roll Back Exact Recorded Roots` accepts observed Rem IDs for one known run and refuses any ID outside the configured target.
+- Rollback deletes topmost recorded roots only, allowing RemNote to remove their recorded descendants without touching pre-existing siblings.
