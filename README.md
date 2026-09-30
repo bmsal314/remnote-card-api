@@ -99,3 +99,13 @@ the recorded run before rebuilding the same payload.
 - `API: Roll Back Last Plugin Build` removes only the recorded Rem IDs under the recorded target.
 - `API: Roll Back Exact Recorded Roots` accepts observed Rem IDs for one known run and refuses any ID outside the configured target.
 - Rollback deletes topmost recorded roots only, allowing RemNote to remove their recorded descendants without touching pre-existing siblings.
+
+## Mixed-card repair (v0.2.3)
+
+- Cloze ranges are represented as native rich-text elements with a unique cloze ID.
+- List answer children are marked as multiline card items and numbered list items.
+- New headings have practice disabled.
+- Production IDs are recorded before subsequent card operations, including list children.
+- Build errors produce a visible stop message; roll back before retrying.
+- `API: Archive Verified Run And Allow Next Build` retains the run and rollback IDs in `verifiedProductionRuns`, then clears the pending-run record. Use only after external readback, reload, visual and Practice verification. Archived IDs can be supplied to exact-root rollback with the correct target.
+- Card indexing is asynchronous: verify cards after the command finishes, not immediately after creating each Rem.

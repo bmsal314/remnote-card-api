@@ -13,6 +13,7 @@ const PAYLOAD_SETTING = 'card-payload';
 const TARGET_SETTING = 'target-document-id';
 const ROLLBACK_IDS_SETTING = 'rollback-rem-ids';
 const LAST_RUN_KEY = 'lastProductionRun';
+const ARCHIVE_KEY = 'verifiedProductionRuns';
 const REGRESSION_KEY = 'hierarchyRegressionState';
 const SAMPLE_IMAGE =
   'https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/Placeholder_view_vector.svg/320px-Placeholder_view_vector.svg.png';
@@ -59,6 +60,7 @@ async function makeSection(plugin: ReactRNPlugin, parent: any, title: string) {
   if (!section) throw new Error('Could not create section');
   await section.setText(await text(plugin, title));
   await section.setParent(parent);
+  await section.setPracticeDirection('none');
   await section.setFontSize('H2');
   await section.setHighlightColor('Blue');
   return section;
@@ -75,9 +77,12 @@ async function makeCard(
     cloze?: { start: number; end: number };
     imageUrl?: string;
   },
+  recordCreated?: (id: string) => Promise<void>,
 ) {
   const rem = await plugin.rem.createRem();
   if (!rem) throw new Error('Could not create card Rem');
+  await rem.setParent(parent);
+  if (recordCreated) await recordCreated(rem._id);
 
   let frontBuilder = plugin.richText.text(spec.front);
   if (spec.imageUrl) {
@@ -85,7 +90,13 @@ async function makeCard(
   }
   let front = await frontBuilder.value();
   if (spec.cloze) {
-    front = await plugin.richText.applyTextFormatToRange(front, spec.cloze.start, spec.cloze.end, 'cloze');
+    const { start, end } = spec.cloze;
+    if (start < 0 || end <= start || end > spec.front.length) throw new Error('Invalid cloze range');
+    front = [
+      { i: 'm' as const, text: spec.front.slice(0, start) },
+      { i: 'm' as const, text: spec.front.slice(start, end), cId: `cloze-${rem._id}` },
+      { i: 'm' as const, text: spec.front.slice(end) },
+     ].filter((part) => part.text.length);
   }
   await rem.setText(front);
 
@@ -108,7 +119,7 @@ async function makeCard(
       await rem.setPracticeDirection('both');
       break;
     case 'list':
-      await rem.setIsCardItem(true);
+      await rem.setPracticeDirection('forward');
       break;
     case 'cloze':
       break;
@@ -124,6 +135,9 @@ async function makeCard(
       if (!item) throw new Error('Could not create list item');
       await item.setText(await text(plugin, itemText));
       await item.setParent(rem);
+      if (recordCreated) await recordCreated(item._id);
+      await item.setIsCardItem(true);
+      await item.setIsListItem(true);
     }
   }
   return rem;
@@ -267,6 +281,7 @@ async function buildSections(plugin: ReactRNPlugin, parent: any, sections: any[]
       if (!node) throw new Error(`Could not create section "${s.title}"`);
       await node.setText(await text(plugin, s.title));
       await node.setParent(parent);
+      await node.setPracticeDirection('none');
       if (s.heading === 'H1' || s.heading === 'H2' || s.heading === 'H3') await node.setFontSize(s.heading);
       if (s.highlight) await node.setHighlightColor(s.highlight);
       counts.created += 1;
@@ -274,8 +289,10 @@ async function buildSections(plugin: ReactRNPlugin, parent: any, sections: any[]
       await plugin.storage.setSynced(LAST_RUN_KEY, run);
     }
     for (const spec of s.cards ?? []) {
-      const card = await makeCard(plugin, node, spec);
-      run.createdIds.push(card._id);
+      await makeCard(plugin, node, spec, async (id) => {
+        run.createdIds.push(id);
+        await plugin.storage.setSynced(LAST_RUN_KEY, run);
+      });
       counts.cards += 1;
       await plugin.storage.setSynced(LAST_RUN_KEY, run);
     }
@@ -322,10 +339,32 @@ async function buildIntoTarget(plugin: ReactRNPlugin) {
   const counts = { created: 0, skipped: 0, cards: 0 };
   const run = { targetId, createdIds: [] as string[] };
   await plugin.storage.setSynced(LAST_RUN_KEY, run);
-  await buildSections(plugin, target, sections, counts, run);
+  try {
+    await buildSections(plugin, target, sections, counts, run);
+  } catch (e) {
+    await plugin.app.toast(`Build stopped: ${(e as Error).message}. Use Roll Back Last Plugin Build before retrying.`);
+    return;
+  }
   await plugin.app.toast(
     `Build complete: ${counts.cards} cards, ${counts.created} new sections, ${counts.skipped} existing sections reused. Existing content was not modified.`,
   );
+}
+
+// Archiving is explicit and keeps the complete rollback IDs in synced storage.
+async function archiveVerifiedRun(plugin: ReactRNPlugin) {
+  const run = await plugin.storage.getSynced<{targetId: string; createdIds: string[]}>(LAST_RUN_KEY);
+  if (!run?.createdIds?.length) { await plugin.app.toast('No pending run to archive.'); return; }
+  for (const id of run.createdIds) {
+    if (!(await plugin.rem.findOne(id))) throw new Error(`Archive refused: recorded Rem ${id} is missing.`);
+  }
+  const root = await plugin.rem.findOne(run.targetId);
+  if (!root) throw new Error('Archive refused: target is missing.');
+  await verifyReadback(plugin, root, 'lastTargetVerificationReceipt', 'the target document');
+  const history = await plugin.storage.getSynced<any[]>(ARCHIVE_KEY) ?? [];
+  history.push({ ...run, archivedAt: new Date().toISOString() });
+  await plugin.storage.setSynced(ARCHIVE_KEY, history);
+  await plugin.storage.setSynced(LAST_RUN_KEY, undefined);
+  await plugin.app.toast('Verified run archived with rollback IDs retained. Next build is enabled.');
 }
 
 async function rollbackIds(plugin: ReactRNPlugin, ids: string[], targetId: string, label: string) {
@@ -511,7 +550,7 @@ async function onActivate(plugin: ReactRNPlugin) {
   });
 
   const commands = [
-    { id: 'create-disposable', name: 'API Test: Create Disposable Fixture', action: () => createDisposable(plugin) },
+    { id: 'create-disposable', name: 'API Test: Create Disposable Fixture', action: async () => { try { await createDisposable(plugin); } catch (e) { await plugin.app.toast(`Disposable build stopped: ${(e as Error).message}`); } } },
     { id: 'create-from-payload', name: 'API Test: Create Cards From Supplied Payload', action: () => createFromPayload(plugin) },
     { id: 'verify-disposable', name: 'API Test: Verify Disposable Fixture', action: () => verifyDisposable(plugin) },
     { id: 'delete-disposable', name: 'API Test: Delete Disposable Fixture', action: () => deleteDisposable(plugin) },
@@ -519,6 +558,7 @@ async function onActivate(plugin: ReactRNPlugin) {
     { id: 'verify-hierarchy-regression', name: 'API Test: Verify Existing-Hierarchy Reuse', action: () => verifyHierarchyRegression(plugin, false) },
     { id: 'verify-hierarchy-rollback', name: 'API Test: Verify Regression After Rollback', action: () => verifyHierarchyRegression(plugin, true) },
     { id: 'build-into-target', name: 'API: Build Cards Into Target Document From Payload', action: () => buildIntoTarget(plugin) },
+    { id: 'archive-verified-run', name: 'API: Archive Verified Run And Allow Next Build', action: () => archiveVerifiedRun(plugin) },
     { id: 'verify-target', name: 'API: Verify Target Document', action: () => verifyTarget(plugin) },
     { id: 'rollback-last-run', name: 'API: Roll Back Last Plugin Build', action: () => rollbackLastRun(plugin) },
     { id: 'rollback-exact-roots', name: 'API: Roll Back Exact Recorded Roots', action: () => rollbackExactRoots(plugin) },
